@@ -1,0 +1,6 @@
+{
+  "trig_mode": "II",
+  "frequency": "10",
+  "current": "140",
+  "trigger_source": "$DTRIG"
+}

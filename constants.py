@@ -1,0 +1,4 @@
+"""CONSTANTS"""
+
+FLASHES = 10
+MINCURR = 128

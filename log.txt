@@ -1,0 +1,56 @@
+SpinCore Technologies, Inc. SpinAPI ver. 20171214
+Logfile created: Thu Mar  6 14:30:22 2025
+
+Markers: (I) info, (W) warning, (E) error.
+
+================================================================================================
+    TIME     FUNCTION                     MESSAGE                      
+================================================================================================
+(I) 14:30:22 os_count_boards:177         Registering WinDriver...
+(I) 14:30:22 RegisterWinDriver:135       Using WinDriver version 1031.
+(I) 14:30:22 RegisterWinDriver:151       lic.dwLicense:  0x2051dfc
+(I) 14:30:22 RegisterWinDriver:152       lic.dwLicense2: 0x88
+(I) 14:30:22 RegisterWinDriver:153       license setup succeeded
+(I) 14:30:22 os_usb_count_devices:71     os_usb_count_devices: Enumerating USB Devices...
+(I) 14:30:22 os_usb_count_devices:130    -SP9 Board Detected (pid_c1ab).
+(I) 14:30:22 os_usb_count_devices:145    Device Handle=0x1fc
+(I) 14:30:22 os_usb_count_devices:146    --System Path: \\?\usb#vid_0403&pid_c1ab#5&3b91642c&0&1#{ae18aa60-7f6a-11d4-97dd-00010229b959}
+(I) 14:30:22 os_usb_count_devices:86     os_usb_count_devices: Enumeration Completed. Found 1 Devices.
+(I) 14:30:22 pb_count_boards:144         pb_count_boards(): Detected 1 boards in your system.
+(I) 14:30:22 pb_select_board:171         pb_select_board(..): Selecting usb board: 0
+(I) 14:30:22 usb_set_device:54           usb_set_device: board num 0
+(I) 14:30:22 pb_init:188                 Entering pb_init. cur_board = 0
+(I) 14:30:22 os_usb_count_devices:71     os_usb_count_devices: Enumerating USB Devices...
+(I) 14:30:22 os_usb_count_devices:130    -SP9 Board Detected (pid_c1ab).
+(I) 14:30:22 os_usb_count_devices:145    Device Handle=0x224
+(I) 14:30:22 os_usb_count_devices:146    --System Path: \\?\usb#vid_0403&pid_c1ab#5&3b91642c&0&1#{ae18aa60-7f6a-11d4-97dd-00010229b959}
+(I) 14:30:22 os_usb_count_devices:86     os_usb_count_devices: Enumeration Completed. Found 1 Devices.
+(I) 14:30:22 pb_count_boards:144         pb_count_boards(): Detected 1 boards in your system.
+(I) 14:30:22 do_os_init:1623             do_os_init: board # 0
+(I) 14:30:22 do_os_init:1624             do_os_init: num_pci_boards: 0
+(I) 14:30:22 do_os_init:1625             do_os_init: num_usb_devices: 1
+(I) 14:30:22 do_os_init:1635             do_os_init: initializing usb
+(I) 14:30:22 usb_get_num_endpoints:434   Detected endpoints: 3
+(I) 14:30:22 usb_get_friendly_name:404   Friendly Name: SpinCore Technologies, Inc. PulseBlaster
+(I) 14:30:22 usb_get_driver_version:462  Driver version: 50594147
+(I) 14:30:22 get_caps:22                 dev_id=0xc1ab
+(I) 14:30:22 get_caps:782                found USB PulseBlaster (firmware_id=0x1b08)
+(I) 14:30:22 get_caps:797                pb_core_version=20090617
+(I) 14:30:22 pb_start_programming:265    pb_start_programming (device=0)
+(I) 14:30:22 pb_start_programming:276    pb_start_programming: Using new programming method.
+(I) 14:30:22 pb_inst_pbonly64:856        pb_inst_pbonly: inst=140733193388040, inst_data=0,length=20.000000, flags=0x00000000
+(I) 14:30:22 pb_inst_direct:1074         pb_inst_direct: Programming DDS2 IMW: 0x20000000 0 8 7.
+
+(I) 14:30:22 pb_inst_pbonly64:856        pb_inst_pbonly: inst=140733193388032, inst_data=0,length=10.000000, flags=0x00200001
+(I) 14:30:22 pb_inst_direct:1074         pb_inst_direct: Programming DDS2 IMW: 0x20000000 2000 1000000 2.
+
+(I) 14:30:22 pb_inst_pbonly64:856        pb_inst_pbonly: inst=140733193388032, inst_data=0,length=10.000000, flags=0x00200002
+(I) 14:30:22 pb_inst_direct:1074         pb_inst_direct: Programming DDS2 IMW: 0x20000000 2000 2000000 2.
+
+(I) 14:30:22 pb_inst_pbonly64:856        pb_inst_pbonly: inst=140733193388038, inst_data=0,length=1000000.000000, flags=0x00000000
+(I) 14:30:22 pb_inst_direct:1074         pb_inst_direct: Programming DDS2 IMW: 0x20000000 0 6 7A11D.
+
+(I) 14:30:22 pb_stop_programming:429     pb_stop_programming: (device=0)
+(I) 14:30:22 pb_stop_programming:467     pb_stop_programming(PULSE_PROGRAM): Writing shape period information to DDS-II board
+(I) 14:30:22 pb_reset:583                pb_reset():
+(I) 14:30:22 pb_start:488                pb_start():
