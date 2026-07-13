@@ -25,6 +25,9 @@ LASERS = {
     "laser2": {"ip": "192.168.103.103", "port": 23, "mac": "00:80:A3:6B:E4:65"},
 }
 
+# GFT1004 delay generator TRIG modes (see NUT007 manual, section 4.2.3)
+TRIGGER_MODES = ["INH", "IN1", "IN2", "EXT", "LSS", "F1", "F2", "F3", "SS1", "SS2"]
+
 # Full 256-entry CRC16 lookup table
 CRC16_LOOKUP_TABLE = [
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
@@ -350,6 +353,18 @@ class DelayGeneratorController:
     def get_delay(self, channel):
         return self.query(f"DELAY? T{channel}")
 
+    def set_trigger(self, channel, mode):
+        self.send_command(f"TRIG T{channel},{mode}")
+
+    def get_trigger(self, channel):
+        return self.query(f"TRIG? T{channel}")
+
+    def set_frequency(self, fn, freq_hz):
+        self.send_command(f"FREQ F{fn},{int(freq_hz)}")
+
+    def get_frequency(self, fn):
+        return self.query(f"FREQ? F{fn}")
+
 
 # ===============================
 # Application GUI
@@ -457,6 +472,7 @@ class CombinedApp:
 
         self.rs232_ports = scan_for_lasers()
         self.rs232_sessions = {f"rs{i+1}": ser for i, (_, ser) in enumerate(self.rs232_ports)}
+        self.rs232_entries = {}
 
         for i, (label, ser) in enumerate(self.rs232_sessions.items()):
             col = i
@@ -465,12 +481,14 @@ class CombinedApp:
             gear = ttk.Entry(rs_frame, width=5)
             trig = ttk.Entry(rs_frame, width=5)
             freq = ttk.Entry(rs_frame, width=5)
-            gear.insert(0, "2")
-            trig.insert(0, "0")
+            gear.insert(0, "6")
+            trig.insert(0, "1")
             freq.insert(0, "10.0")
             gear.grid(row=1, column=col)
             trig.grid(row=2, column=col)
             freq.grid(row=3, column=col)
+
+            self.rs232_entries[label] = {"gear": gear, "trig": trig, "freq": freq}
 
             ttk.Button(rs_frame, text="Config",
                        command=lambda s=ser, g=gear, t=trig, f=freq: (
@@ -488,6 +506,12 @@ class CombinedApp:
                        command=lambda s=ser: log(
                            decode_status_response(send_status_command(s, STATUS_ADDR)), self.console)
                        ).grid(row=7, column=col)
+
+        # --- QOL: configure every laser (ASCII + RS232) in one click ---
+        qol_frame = ttk.Frame(parent)
+        qol_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
+        ttk.Button(qol_frame, text="Configure All Lasers",
+                   command=self._configure_all_lasers).pack(fill="x")
 
     # -----------------------------------------------------------------------
     # Delay Tab  [Updated from new_delaycontrol.py]
@@ -586,6 +610,37 @@ class CombinedApp:
         for i in range(10):
             self.dg_tree.insert("", "end", iid=f"T{i}", values=(f"T{i}", "0"))
 
+        # -- Trigger settings --
+        trig_frame = ttk.LabelFrame(parent, text="Trigger Settings")
+        trig_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(trig_frame, text="Frequency 1 (Hz):").grid(row=0, column=0, padx=5, pady=3, sticky="e")
+        self.dg_freq1 = ttk.Entry(trig_frame, width=10)
+        self.dg_freq1.insert(0, "1000")
+        self.dg_freq1.grid(row=0, column=1, padx=5, pady=3)
+
+        ttk.Label(trig_frame, text="Frequency 2 (Hz):").grid(row=0, column=2, padx=5, pady=3, sticky="e")
+        self.dg_freq2 = ttk.Entry(trig_frame, width=10)
+        self.dg_freq2.insert(0, "1000")
+        self.dg_freq2.grid(row=0, column=3, padx=5, pady=3)
+
+        self.trig_vars = []
+        for i in range(10):
+            var = tk.StringVar(value="INH")
+            self.trig_vars.append(var)
+            row = 1 + i // 5
+            col = (i % 5) * 2
+            ttk.Label(trig_frame, text=f"T{i}").grid(row=row, column=col, padx=3, pady=3, sticky="e")
+            ttk.Combobox(trig_frame, textvariable=var, values=TRIGGER_MODES,
+                         width=6, state="readonly").grid(row=row, column=col + 1, padx=3, pady=3)
+
+        trig_btn_frame = ttk.Frame(trig_frame)
+        trig_btn_frame.grid(row=3, column=0, columnspan=10, pady=5)
+        ttk.Button(trig_btn_frame, text="Send Trigger Settings",
+                   command=self._send_trigger_settings).pack(side="left", padx=5)
+        ttk.Button(trig_btn_frame, text="Refresh Trigger from Device",
+                   command=self._refresh_trigger_settings).pack(side="left", padx=5)
+
     # -----------------------------------------------------------------------
     # Laser helpers  [UNTOUCHED]
     # -----------------------------------------------------------------------
@@ -612,6 +667,34 @@ class CombinedApp:
             send_ascii_cmd(tn, "$STANDBY", self.console)
         except Exception as e:
             log(f"Standby error: {e}", self.console)
+
+    def _configure_all_lasers(self):
+        log("=== Configuring all lasers ===", self.console)
+        settings = self._ascii_settings()
+
+        for name in LASERS:
+            tn = self.sessions.get(name)
+            if not tn:
+                log(f"{name} not connected, skipping", self.console)
+                continue
+            configure_ascii_laser(name, tn, settings, self.console)
+
+        for label, ser in self.rs232_sessions.items():
+            entries = self.rs232_entries.get(label)
+            if not entries:
+                continue
+            try:
+                gear = int(entries["gear"].get())
+                trig = int(entries["trig"].get())
+                freq = float(entries["freq"].get())
+                send_gear_command(ser, CONFIG_ADDR, gear)
+                send_trigger_command(ser, CONFIG_ADDR, trig)
+                send_frequency_command(ser, CONFIG_ADDR, freq)
+                log(f"{label} configured (gear={gear}, trig={trig}, freq={freq})", self.console)
+            except Exception as e:
+                log(f"Error configuring {label}: {e}", self.console)
+
+        log("=== Done configuring all lasers ===", self.console)
 
     # -----------------------------------------------------------------------
     # Delay helpers  [Updated from new_delaycontrol.py]
@@ -711,6 +794,44 @@ class CombinedApp:
             except Exception:
                 pass
         log("Refreshed T0..T9 from device", self.console)
+
+    def _send_trigger_settings(self):
+        if not self.delay_controller.sock:
+            messagebox.showerror("Not connected", "Delay generator not connected")
+            return
+        try:
+            self.delay_controller.set_frequency(1, float(self.dg_freq1.get()))
+            self.delay_controller.set_frequency(2, float(self.dg_freq2.get()))
+            for i, var in enumerate(self.trig_vars):
+                self.delay_controller.set_trigger(i, var.get())
+                time.sleep(0.02)
+            messagebox.showinfo("Sent", "Trigger settings sent")
+            log("Sent trigger settings to delay generator", self.console)
+        except Exception as e:
+            messagebox.showerror("Send error", str(e))
+
+    def _refresh_trigger_settings(self):
+        if not self.delay_controller.sock:
+            messagebox.showerror("Not connected", "Delay generator not connected")
+            return
+        for i, var in enumerate(self.trig_vars):
+            try:
+                resp = self.delay_controller.get_trigger(i)
+                if resp and "," in resp:
+                    mode = resp.split(",")[-1].strip()
+                    if mode in TRIGGER_MODES:
+                        var.set(mode)
+            except Exception:
+                pass
+        for fn, entry in ((1, self.dg_freq1), (2, self.dg_freq2)):
+            try:
+                resp = self.delay_controller.get_frequency(fn)
+                if resp and "," in resp:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, resp.split(",")[-1].strip())
+            except Exception:
+                pass
+        log("Refreshed trigger settings from device", self.console)
 
 
 # ===============================
