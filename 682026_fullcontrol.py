@@ -359,6 +359,12 @@ class DelayGeneratorController:
     def get_trigger(self, channel):
         return self.query(f"TRIG? T{channel}")
 
+    def set_width(self, channel, width_ns):
+        self.send_command(f"WIDTH T{channel},{int(width_ns)}")
+
+    def get_width(self, channel):
+        return self.query(f"WIDTH? T{channel}")
+
     def set_frequency(self, fn, freq_hz):
         self.send_command(f"FREQ F{fn},{int(freq_hz)}")
 
@@ -512,6 +518,8 @@ class CombinedApp:
         qol_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
         ttk.Button(qol_frame, text="Configure All Lasers",
                    command=self._configure_all_lasers).pack(fill="x")
+        ttk.Button(qol_frame, text="Disable All Lasers",
+                   command=self._disable_all_lasers).pack(fill="x", pady=(4, 0))
 
     # -----------------------------------------------------------------------
     # Delay Tab  [Updated from new_delaycontrol.py]
@@ -530,9 +538,9 @@ class CombinedApp:
         self.adv = tk.DoubleVar(value=16.625)
         self.adv_unit = tk.StringVar(value="ms")
 
-        # Manual T8 / T9 (available but overridden by formula in calculate)
-        self.t8 = tk.DoubleVar(value=0.0)
-        self.t9 = tk.DoubleVar(value=0.0)
+        # Manual T8 / T9 override (used by calculate when non-empty, otherwise formula applies)
+        self.t8 = tk.StringVar(value="")
+        self.t9 = tk.StringVar(value="")
 
         # Unit for P/S inputs
         self.unit = tk.StringVar(value="us")
@@ -581,7 +589,7 @@ class CombinedApp:
             ttk.Entry(hl_frame, textvariable=var, width=10).grid(row=0, column=idx * 2 + 1, padx=5, pady=5)
 
         # -- Manual T8 / T9 --
-        manual_frame = ttk.LabelFrame(parent, text="Manual T8 & T9 (enter in P/S unit)")
+        manual_frame = ttk.LabelFrame(parent, text="Manual T8 & T9 override (enter in P/S unit; leave blank to use formula)")
         manual_frame.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(manual_frame, text="T8").grid(row=0, column=0, padx=5)
@@ -625,14 +633,19 @@ class CombinedApp:
         self.dg_freq2.grid(row=0, column=3, padx=5, pady=3)
 
         self.trig_vars = []
+        self.width_vars = []
         for i in range(10):
             var = tk.StringVar(value="INH")
             self.trig_vars.append(var)
+            width_var = tk.StringVar(value="500")
+            self.width_vars.append(width_var)
             row = 1 + i // 5
-            col = (i % 5) * 2
+            col = (i % 5) * 4
             ttk.Label(trig_frame, text=f"T{i}").grid(row=row, column=col, padx=3, pady=3, sticky="e")
             ttk.Combobox(trig_frame, textvariable=var, values=TRIGGER_MODES,
                          width=6, state="readonly").grid(row=row, column=col + 1, padx=3, pady=3)
+            ttk.Entry(trig_frame, textvariable=width_var, width=6).grid(row=row, column=col + 2, padx=(3, 0), pady=3)
+            ttk.Label(trig_frame, text="ns").grid(row=row, column=col + 3, padx=(0, 3), pady=3, sticky="w")
 
         trig_btn_frame = ttk.Frame(trig_frame)
         trig_btn_frame.grid(row=3, column=0, columnspan=10, pady=5)
@@ -696,6 +709,26 @@ class CombinedApp:
 
         log("=== Done configuring all lasers ===", self.console)
 
+    def _disable_all_lasers(self):
+        log("=== Disabling all lasers ===", self.console)
+
+        for name in LASERS:
+            tn = self.sessions.get(name)
+            if not tn:
+                log(f"{name} not connected, skipping", self.console)
+                continue
+            standby_ascii(tn, self.console)
+            log(f"{name} set to standby", self.console)
+
+        for label, ser in self.rs232_sessions.items():
+            try:
+                send_disable_command(ser, CONFIG_ADDR)
+                log(f"{label} disabled", self.console)
+            except Exception as e:
+                log(f"Error disabling {label}: {e}", self.console)
+
+        log("=== Done disabling all lasers ===", self.console)
+
     # -----------------------------------------------------------------------
     # Delay helpers  [Updated from new_delaycontrol.py]
     # -----------------------------------------------------------------------
@@ -753,8 +786,12 @@ class CombinedApp:
         t5 = adv + p1
         t6 = t5 + s1
         t7 = t6 + p2
-        t8 = t7 + s2
-        t9 = t8 + p3
+
+        manual_t8 = self.t8.get().strip()
+        t8 = self._convert_to_ps(manual_t8) if manual_t8 else (t7 + s2)
+
+        manual_t9 = self.t9.get().strip()
+        t9 = self._convert_to_ps(manual_t9) if manual_t9 else (t8 + p3)
 
         computed = [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9]
         for i, val in enumerate(computed):
@@ -805,6 +842,8 @@ class CombinedApp:
             for i, var in enumerate(self.trig_vars):
                 self.delay_controller.set_trigger(i, var.get())
                 time.sleep(0.02)
+                self.delay_controller.set_width(i, float(self.width_vars[i].get()))
+                time.sleep(0.02)
             messagebox.showinfo("Sent", "Trigger settings sent")
             log("Sent trigger settings to delay generator", self.console)
         except Exception as e:
@@ -821,6 +860,12 @@ class CombinedApp:
                     mode = resp.split(",")[-1].strip()
                     if mode in TRIGGER_MODES:
                         var.set(mode)
+            except Exception:
+                pass
+            try:
+                resp = self.delay_controller.get_width(i)
+                if resp and "," in resp:
+                    self.width_vars[i].set(resp.split(",")[-1].strip())
             except Exception:
                 pass
         for fn, entry in ((1, self.dg_freq1), (2, self.dg_freq2)):
