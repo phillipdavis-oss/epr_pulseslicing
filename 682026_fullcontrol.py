@@ -373,6 +373,65 @@ class DelayGeneratorController:
 
 
 # ===============================
+# Stepper Motor Controller (Arduino / TMC2209)  [New]
+# ===============================
+STEPPER_BAUD = 115200
+STEPPER_DEFAULT_TIMEOUT = 2.0
+STEPPER_HOME_TIMEOUT = 90.0
+STEPPER_MOTORS = [1, 2, 3, 4, 5]
+STEPPER_MOVE_MOTORS = [1, 2]        # support M / Z
+STEPPER_ROTATE_MOTORS = [3, 4, 5]   # support R
+
+
+class ArduinoStepperController:
+    def __init__(self, port=None, baud=STEPPER_BAUD, timeout=STEPPER_DEFAULT_TIMEOUT):
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
+        self.ser = None
+
+    def connect(self, port):
+        self.port = port
+        try:
+            self.ser = serial.Serial(port, self.baud, timeout=self.timeout)
+            time.sleep(2.0)  # allow Arduino auto-reset on connect
+            self.ser.reset_input_buffer()
+            return True
+        except serial.SerialException as e:
+            messagebox.showerror("Connection Error", f"Failed to connect: {e}")
+            self.ser = None
+            return False
+
+    def disconnect(self):
+        if self.ser:
+            self.ser.close()
+            self.ser = None
+
+    def query(self, command, timeout=None):
+        if not self.ser:
+            raise ConnectionError("Stepper controller is not connected. Call connect() first.")
+        self.ser.timeout = timeout if timeout is not None else self.timeout
+        self.ser.reset_input_buffer()
+        self.ser.write((command.strip() + "\n").encode("ascii"))
+        return self.ser.readline().decode("ascii", errors="ignore").strip()
+
+    def move(self, motor, steps):
+        return self.query(f"{motor} M{steps:+d}")
+
+    def get_position(self, motor):
+        return self.query(f"{motor} P")
+
+    def set_step_delay(self, motor, delay_us):
+        return self.query(f"{motor} S{int(delay_us)}")
+
+    def home(self, motor):
+        return self.query(f"{motor} Z", timeout=STEPPER_HOME_TIMEOUT)
+
+    def rotate(self, motor, positive):
+        return self.query(f"{motor} R{'+' if positive else '-'}")
+
+
+# ===============================
 # Application GUI
 # ===============================
 class CombinedApp:
@@ -393,11 +452,14 @@ class CombinedApp:
         # Tabs
         self.laser_tab = ttk.Frame(self.notebook)
         self.delay_tab = ttk.Frame(self.notebook)
+        self.stepper_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.laser_tab, text="Laser Control")
         self.notebook.add(self.delay_tab, text="Delay Generator")
+        self.notebook.add(self.stepper_tab, text="Stepper Motors")
 
         self._build_laser_tab(self.laser_tab)
         self._build_delay_tab(self.delay_tab)
+        self._build_stepper_tab(self.stepper_tab)
 
     # -----------------------------------------------------------------------
     # Laser Tab  [Virion section untouched; RS232 section updated for CNI]
@@ -655,6 +717,73 @@ class CombinedApp:
                    command=self._refresh_trigger_settings).pack(side="left", padx=5)
 
     # -----------------------------------------------------------------------
+    # Stepper Tab  [New]
+    # -----------------------------------------------------------------------
+    def _build_stepper_tab(self, parent):
+        self.stepper_controller = ArduinoStepperController()
+        self.stepper_pos_labels = {}
+        self.stepper_move_entries = {}
+
+        # -- Connection frame --
+        conn_frame = ttk.LabelFrame(parent, text="Connection")
+        conn_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(conn_frame, text="Port:").pack(side="left", padx=2)
+        self.stepper_port = ttk.Combobox(conn_frame, width=18, state="readonly")
+        self.stepper_port.pack(side="left", padx=2)
+        self._stepper_refresh_ports()
+
+        ttk.Button(conn_frame, text="Refresh Ports",
+                   command=self._stepper_refresh_ports).pack(side="left", padx=5)
+        ttk.Label(conn_frame, text="Baud: 115200").pack(side="left", padx=10)
+        ttk.Button(conn_frame, text="Connect",    command=self._stepper_connect).pack(side="left", padx=5)
+        ttk.Button(conn_frame, text="Disconnect", command=self._stepper_disconnect).pack(side="left", padx=5)
+
+        # -- Global step delay --
+        delay_frame = ttk.LabelFrame(parent, text="Global Step Delay")
+        delay_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(delay_frame, text="Delay (us):").pack(side="left", padx=5)
+        self.stepper_delay = ttk.Entry(delay_frame, width=10)
+        self.stepper_delay.insert(0, "1000")
+        self.stepper_delay.pack(side="left", padx=5)
+        ttk.Button(delay_frame, text="Set Delay (All Motors)",
+                   command=self._stepper_set_delay).pack(side="left", padx=5)
+
+        # -- Motor grid --
+        motor_frame = ttk.LabelFrame(parent, text="Motors")
+        motor_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        for col, m in enumerate(STEPPER_MOTORS):
+            ttk.Label(motor_frame, text=f"Motor {m}",
+                      font=("TkDefaultFont", 10, "bold")).grid(row=0, column=col, padx=8, pady=5)
+
+            if m in STEPPER_MOVE_MOTORS:
+                steps = ttk.Entry(motor_frame, width=8)
+                steps.insert(0, "400")
+                steps.grid(row=1, column=col, padx=8, pady=2)
+                self.stepper_move_entries[m] = steps
+
+                ttk.Button(motor_frame, text="Move",
+                           command=lambda m=m: self._stepper_move(m)).grid(row=2, column=col, padx=8, pady=2)
+                ttk.Button(motor_frame, text="Home && Zero",
+                           command=lambda m=m: self._stepper_home(m)).grid(row=3, column=col, padx=8, pady=2)
+            else:
+                ttk.Button(motor_frame, text="Rotate +90°",
+                           command=lambda m=m: self._stepper_rotate(m, True)).grid(row=1, column=col, padx=8, pady=2)
+                ttk.Button(motor_frame, text="Rotate -90°",
+                           command=lambda m=m: self._stepper_rotate(m, False)).grid(row=2, column=col, padx=8, pady=2)
+
+            pos_label = ttk.Label(motor_frame, text="Pos: ?")
+            pos_label.grid(row=4, column=col, padx=8, pady=(10, 2))
+            self.stepper_pos_labels[m] = pos_label
+            ttk.Button(motor_frame, text="Get Position",
+                       command=lambda m=m: self._stepper_get_position(m)).grid(row=5, column=col, padx=8, pady=2)
+
+        ttk.Button(motor_frame, text="Get All Positions",
+                   command=self._stepper_get_all_positions).grid(row=6, column=0, columnspan=5, pady=8)
+
+    # -----------------------------------------------------------------------
     # Laser helpers  [UNTOUCHED]
     # -----------------------------------------------------------------------
     def _ascii_settings(self):
@@ -877,6 +1006,88 @@ class CombinedApp:
             except Exception:
                 pass
         log("Refreshed trigger settings from device", self.console)
+
+    # -----------------------------------------------------------------------
+    # Stepper helpers  [New]
+    # -----------------------------------------------------------------------
+    def _stepper_refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.stepper_port["values"] = ports
+        if ports and not self.stepper_port.get():
+            self.stepper_port.set(ports[0])
+
+    def _stepper_connect(self):
+        port = self.stepper_port.get().strip()
+        if not port:
+            messagebox.showerror("Stepper", "Select a serial port first")
+            return
+        if self.stepper_controller.connect(port):
+            log(f"Stepper controller connected on {port}", self.console)
+            messagebox.showinfo("Stepper", "Connected")
+
+    def _stepper_disconnect(self):
+        self.stepper_controller.disconnect()
+        log("Stepper controller disconnected", self.console)
+        messagebox.showinfo("Stepper", "Disconnected")
+
+    def _stepper_set_delay(self):
+        try:
+            delay = int(self.stepper_delay.get())
+        except ValueError:
+            messagebox.showerror("Stepper", "Delay must be an integer")
+            return
+        try:
+            resp = self.stepper_controller.set_step_delay(1, delay)
+            log(f"Set global step delay to {delay}us: {resp}", self.console)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_move(self, motor):
+        try:
+            steps = int(self.stepper_move_entries[motor].get())
+        except ValueError:
+            messagebox.showerror("Stepper", "Steps must be an integer")
+            return
+        try:
+            resp = self.stepper_controller.move(motor, steps)
+            log(f"Motor {motor} move {steps:+d}: {resp}", self.console)
+            self._stepper_update_position_label(motor, resp)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_home(self, motor):
+        log(f"Homing motor {motor}... this may take up to ~90s and will block the UI", self.console)
+        try:
+            resp = self.stepper_controller.home(motor)
+            log(f"Motor {motor} home: {resp}", self.console)
+            self._stepper_update_position_label(motor, resp)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_rotate(self, motor, positive):
+        try:
+            resp = self.stepper_controller.rotate(motor, positive)
+            log(f"Motor {motor} rotate {'+90' if positive else '-90'}: {resp}", self.console)
+            self._stepper_update_position_label(motor, resp)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_get_position(self, motor):
+        try:
+            resp = self.stepper_controller.get_position(motor)
+            self.stepper_pos_labels[motor].config(text=f"Pos: {resp}")
+            log(f"Motor {motor} position: {resp}", self.console)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_get_all_positions(self):
+        for m in STEPPER_MOTORS:
+            self._stepper_get_position(m)
+
+    def _stepper_update_position_label(self, motor, resp):
+        parts = resp.split()
+        if parts and parts[-1].lstrip("+-").isdigit():
+            self.stepper_pos_labels[motor].config(text=f"Pos: {parts[-1]}")
 
 
 # ===============================
