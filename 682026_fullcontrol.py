@@ -376,11 +376,13 @@ class DelayGeneratorController:
 # Stepper Motor Controller (Arduino / TMC2209)  [New]
 # ===============================
 STEPPER_BAUD = 115200
+STEPPER_DEFAULT_PORT = "/dev/ttyACM0"
 STEPPER_DEFAULT_TIMEOUT = 2.0
 STEPPER_HOME_TIMEOUT = 90.0
 STEPPER_MOTORS = [1, 2, 3, 4, 5]
-STEPPER_MOVE_MOTORS = [1, 2]        # support M / Z
-STEPPER_ROTATE_MOTORS = [3, 4, 5]   # support R
+STEPPER_MOVE_MOTORS = [1, 2]        # phase motors; support M / Z
+STEPPER_ROTATE_MOTORS = [3, 4, 5]   # wafer motors; support R (+ fine M control)
+PHASE_STEP_CONSTANT = 2.157e-5      # steps = phase (deg) / (freq (GHz) * PHASE_STEP_CONSTANT)
 
 
 class ArduinoStepperController:
@@ -723,6 +725,7 @@ class CombinedApp:
         self.stepper_controller = ArduinoStepperController()
         self.stepper_pos_labels = {}
         self.stepper_move_entries = {}
+        self.stepper_fine_entries = {}
 
         # -- Connection frame --
         conn_frame = ttk.LabelFrame(parent, text="Connection")
@@ -780,8 +783,42 @@ class CombinedApp:
             ttk.Button(motor_frame, text="Get Position",
                        command=lambda m=m: self._stepper_get_position(m)).grid(row=5, column=col, padx=8, pady=2)
 
+            if m in STEPPER_ROTATE_MOTORS:
+                fine_frame = ttk.LabelFrame(motor_frame, text="Fine Control")
+                fine_frame.grid(row=6, column=col, padx=8, pady=(10, 2), sticky="ew")
+
+                fine_steps = ttk.Entry(fine_frame, width=6, justify="center")
+                fine_steps.insert(0, "10")
+                fine_steps.pack(side="top", pady=(4, 4))
+                self.stepper_fine_entries[m] = fine_steps
+
+                fine_btn_frame = ttk.Frame(fine_frame)
+                fine_btn_frame.pack(side="top", pady=(0, 4))
+                ttk.Button(fine_btn_frame, text="-", width=3,
+                           command=lambda m=m: self._stepper_fine_move(m, -1)).pack(side="left", padx=2)
+                ttk.Button(fine_btn_frame, text="+", width=3,
+                           command=lambda m=m: self._stepper_fine_move(m, 1)).pack(side="left", padx=2)
+
         ttk.Button(motor_frame, text="Get All Positions",
-                   command=self._stepper_get_all_positions).grid(row=6, column=0, columnspan=5, pady=8)
+                   command=self._stepper_get_all_positions).grid(row=7, column=0, columnspan=5, pady=8)
+
+        # -- Phase step calculator [standalone, not wired to any motor control] --
+        calc_frame = ttk.LabelFrame(parent, text="Phase Step Calculator")
+        calc_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(calc_frame, text="Phase Shift (deg):").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.calc_phase = ttk.Entry(calc_frame, width=10)
+        self.calc_phase.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(calc_frame, text="Frequency (GHz):").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.calc_freq = ttk.Entry(calc_frame, width=10)
+        self.calc_freq.grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Button(calc_frame, text="Calculate Steps",
+                   command=self._calculate_phase_steps).grid(row=0, column=4, padx=10, pady=5)
+
+        self.calc_result = ttk.Label(calc_frame, text="Steps: ?")
+        self.calc_result.grid(row=0, column=5, padx=5, pady=5)
 
     # -----------------------------------------------------------------------
     # Laser helpers  [UNTOUCHED]
@@ -1013,8 +1050,11 @@ class CombinedApp:
     def _stepper_refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.stepper_port["values"] = ports
-        if ports and not self.stepper_port.get():
-            self.stepper_port.set(ports[0])
+        if not self.stepper_port.get():
+            if STEPPER_DEFAULT_PORT in ports:
+                self.stepper_port.set(STEPPER_DEFAULT_PORT)
+            elif ports:
+                self.stepper_port.set(ports[0])
 
     def _stepper_connect(self):
         port = self.stepper_port.get().strip()
@@ -1055,6 +1095,20 @@ class CombinedApp:
         except Exception as e:
             messagebox.showerror("Stepper error", str(e))
 
+    def _stepper_fine_move(self, motor, sign):
+        try:
+            fine_steps = int(self.stepper_fine_entries[motor].get())
+        except ValueError:
+            messagebox.showerror("Stepper", "Fine steps must be an integer")
+            return
+        steps = sign * fine_steps
+        try:
+            resp = self.stepper_controller.move(motor, steps)
+            log(f"Motor {motor} fine move {steps:+d}: {resp}", self.console)
+            self._stepper_update_position_label(motor, resp)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
     def _stepper_home(self, motor):
         log(f"Homing motor {motor}... this may take up to ~90s and will block the UI", self.console)
         try:
@@ -1083,6 +1137,15 @@ class CombinedApp:
     def _stepper_get_all_positions(self):
         for m in STEPPER_MOTORS:
             self._stepper_get_position(m)
+
+    def _calculate_phase_steps(self):
+        try:
+            phase = float(self.calc_phase.get())
+            freq = float(self.calc_freq.get())
+            steps = phase / (freq * PHASE_STEP_CONSTANT)
+            self.calc_result.config(text=f"Steps: {steps:.2f}")
+        except (ValueError, ZeroDivisionError):
+            messagebox.showerror("Calculator", "Enter valid numeric phase shift and frequency")
 
     def _stepper_update_position_label(self, motor, resp):
         parts = resp.split()
