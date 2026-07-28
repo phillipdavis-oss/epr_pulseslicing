@@ -742,16 +742,23 @@ class CombinedApp:
         ttk.Button(conn_frame, text="Connect",    command=self._stepper_connect).pack(side="left", padx=5)
         ttk.Button(conn_frame, text="Disconnect", command=self._stepper_disconnect).pack(side="left", padx=5)
 
-        # -- Global step delay --
-        delay_frame = ttk.LabelFrame(parent, text="Global Step Delay")
+        # -- Step delays --
+        delay_frame = ttk.LabelFrame(parent, text="Step Delays")
         delay_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(delay_frame, text="Delay (us):").pack(side="left", padx=5)
-        self.stepper_delay = ttk.Entry(delay_frame, width=10)
-        self.stepper_delay.insert(0, "1000")
-        self.stepper_delay.pack(side="left", padx=5)
-        ttk.Button(delay_frame, text="Set Delay (All Motors)",
-                   command=self._stepper_set_delay).pack(side="left", padx=5)
+        ttk.Label(delay_frame, text="Shifter Delay (us):").pack(side="left", padx=5)
+        self.shifter_delay = ttk.Entry(delay_frame, width=10)
+        self.shifter_delay.insert(0, "1000")
+        self.shifter_delay.pack(side="left", padx=5)
+        ttk.Button(delay_frame, text="Set Shifter Delay",
+                   command=self._stepper_set_shifter_delay).pack(side="left", padx=5)
+
+        ttk.Label(delay_frame, text="Wafer Delay (us):").pack(side="left", padx=(20, 5))
+        self.wafer_delay = ttk.Entry(delay_frame, width=10)
+        self.wafer_delay.insert(0, "1000")
+        self.wafer_delay.pack(side="left", padx=5)
+        ttk.Button(delay_frame, text="Set Wafer Delay",
+                   command=self._stepper_set_wafer_delay).pack(side="left", padx=5)
 
         # -- Motor grid --
         motor_frame = ttk.LabelFrame(parent, text="Motors")
@@ -1070,15 +1077,27 @@ class CombinedApp:
         log("Stepper controller disconnected", self.console)
         messagebox.showinfo("Stepper", "Disconnected")
 
-    def _stepper_set_delay(self):
+    def _stepper_set_shifter_delay(self):
         try:
-            delay = int(self.stepper_delay.get())
+            delay = int(self.shifter_delay.get())
         except ValueError:
             messagebox.showerror("Stepper", "Delay must be an integer")
             return
         try:
             resp = self.stepper_controller.set_step_delay(1, delay)
-            log(f"Set global step delay to {delay}us: {resp}", self.console)
+            log(f"Set shifter step delay to {delay}us: {resp}", self.console)
+        except Exception as e:
+            messagebox.showerror("Stepper error", str(e))
+
+    def _stepper_set_wafer_delay(self):
+        try:
+            delay = int(self.wafer_delay.get())
+        except ValueError:
+            messagebox.showerror("Stepper", "Delay must be an integer")
+            return
+        try:
+            resp = self.stepper_controller.set_step_delay(3, delay)
+            log(f"Set wafer step delay to {delay}us: {resp}", self.console)
         except Exception as e:
             messagebox.showerror("Stepper error", str(e))
 
