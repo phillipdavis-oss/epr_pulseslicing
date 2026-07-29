@@ -330,6 +330,297 @@ class MockDevice:
                 property_table.bind(index, setter=self.setter(index))
 
 
+class DelayGeneratorBackend:
+    """Drives a Greenfield Technology GFT1004 digital delay generator over
+    raw ASCII TCP (NUT007 Ed.13 4.2), matching the command set used by the
+    working GUI in 682026_fullcontrol.py.
+
+    Every property write recomputes and re-pushes the entire ten-channel
+    state (TRIG, WIDTH, DELAY) in fixed channel order. SpecMan only sends a
+    property when that property's sweep axis advances, so most experiment
+    points touch exactly one of the five bound properties - pushing only the
+    changed channel would leave the rest of the chain holding stale values.
+    Re-pushing everything makes the instrument state a pure function of the
+    backend's held parameters rather than of which subset SpecMan happened
+    to send.
+
+    Units: held state (self._params, chain dict) is picoseconds throughout.
+    DELAY on the wire is picoseconds; WIDTH on the wire is nanoseconds - do
+    not share a conversion helper between the two.
+    """
+
+    HOST_DEFAULT = "192.168.103.22"
+    PORT_DEFAULT = 4000
+
+    TRIG_MODE = "EXT"
+    # Fixed per-channel widths, ns. T2/T3/T8/T9 are the long Q-switch /
+    # tail-end windows; everything else is a short reference/chain pulse.
+    WIDTH_NS = {
+        0: 500, 1: 500, 2: 100_000, 3: 100_000, 4: 500,
+        5: 500, 6: 500, 7: 500, 8: 100_000, 9: 100_000,
+    }
+
+    # T1/T2/T3 are fixed offsets back from ADV, in picoseconds.
+    PRETRIGGER_OFFSET_PS = 244 * 1_000_000  # 244 us laser pretrigger
+    QSDELAY_OFFSET_PS = 179 * 1_000_000     # 179 us, matches $QSDELAY 179
+
+    MAX_DELAY_PS = 9_999_999_999_999
+
+    REQUIRED_NAMES = ("pulseLen1", "pulseLen2", "pulseLen3", "delay1", "delay2")
+    NAME_TO_PARAM = {
+        "pulseLen1": "P1", "pulseLen2": "P2", "pulseLen3": "P3",
+        "delay1": "S1", "delay2": "S2",
+    }
+
+    MAX_PUSH_ATTEMPTS = 2
+
+    def __init__(self, host: str = HOST_DEFAULT, port: int = PORT_DEFAULT, *,
+                 adv_ps: float, timeout: float = 2.0, command_delay: float = 0.02,
+                 dry_run: bool = False, verify_after_push: bool = False):
+        self.host = host
+        self.port = port
+        self._adv_ps = adv_ps
+        self.timeout = timeout
+        self.command_delay = command_delay
+        self.dry_run = dry_run
+        self.verify_after_push = verify_after_push
+
+        self.sock: Optional[socket.socket] = None
+        self._reconnect_count = 0
+        # Held state, picoseconds, intervals in the delay chain (not
+        # absolute delays) - see _compute_chain.
+        self._params: Dict[str, float] = {"P1": 0.0, "P2": 0.0, "P3": 0.0, "S1": 0.0, "S2": 0.0}
+
+    # -- chain math ------------------------------------------------------
+
+    def _compute_chain(self, params: Optional[Dict[str, float]] = None) -> Dict[int, float]:
+        p = params if params is not None else self._params
+        t4 = self._adv_ps
+        t5 = t4 + p["P1"]
+        t6 = t5 + p["S1"]
+        t7 = t6 + p["P2"]
+        t8 = t7 + p["S2"]
+        t9 = t8 + p["P3"]
+        return {
+            1: self._adv_ps - self.PRETRIGGER_OFFSET_PS,
+            2: self._adv_ps - self.QSDELAY_OFFSET_PS,
+            3: self._adv_ps - self.QSDELAY_OFFSET_PS,
+            4: t4, 5: t5, 6: t6, 7: t7, 8: t8, 9: t9,
+        }
+
+    def _validate_chain(self, chain: Dict[int, float]) -> None:
+        for ch in range(1, 10):
+            val = chain[ch]
+            if val < 0:
+                logger.warning("delay generator: T%d computed delay %.0f ps is negative", ch, val)
+                raise PropertyError(
+                    f"delay generator: T{ch} delay {val:.0f} ps is negative", ERR_OUT_OF_RANGE)
+            if val > self.MAX_DELAY_PS:
+                logger.warning(
+                    "delay generator: T%d computed delay %.0f ps exceeds max %d ps",
+                    ch, val, self.MAX_DELAY_PS)
+                raise PropertyError(
+                    f"delay generator: T{ch} delay {val:.0f} ps exceeds max {self.MAX_DELAY_PS} ps",
+                    ERR_OUT_OF_RANGE)
+        for a, b in zip(range(4, 9), range(5, 10)):
+            if chain[a] > chain[b]:
+                logger.warning(
+                    "delay generator: chain non-monotonic T%d (%.0f ps) > T%d (%.0f ps)",
+                    a, chain[a], b, chain[b])
+                raise PropertyError(
+                    f"delay generator: chain non-monotonic T{a} > T{b}", ERR_OUT_OF_RANGE)
+
+    # -- socket lifecycle --------------------------------------------------
+    #
+    # self.sock is assigned only after connect() succeeds - the inherited
+    # implementation in 682026_fullcontrol.py assigns the socket object
+    # before connecting, so a failed connect leaves a dead-but-truthy socket
+    # behind and every `if not self.sock` guard downstream passes anyway.
+
+    def _connect(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect((self.host, self.port))
+        except OSError:
+            sock.close()
+            self.sock = None
+            raise
+        self.sock = sock
+        logger.info("delay generator: connected to %s:%d", self.host, self.port)
+
+    def _ensure_connected(self) -> None:
+        if self.dry_run or self.sock is not None:
+            return
+        self._connect()
+
+    def _close_socket(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def close(self) -> None:
+        """Wired to SpecmanServer.on_disconnect - closes the delay generator
+        socket cleanly when a SpecMan session ends."""
+        self._close_socket()
+
+    # -- wire I/O ----------------------------------------------------------
+
+    def _send_line(self, line: str) -> None:
+        if self.dry_run:
+            logger.info("[dg dry-run] %s", line)
+            return
+        self.sock.sendall((line + "\n").encode("ascii"))
+        logger.debug("dg -> %s", line)
+
+    def _query(self, command: str) -> Optional[str]:
+        """Accumulate-until-timeout read, tolerant of \\n or \\r\\n. The
+        GFT1004's actual response terminator is not documented and has not
+        been confirmed on this unit, so raw bytes are logged at DEBUG rather
+        than asserting a terminator nobody has verified."""
+        if self.dry_run:
+            logger.info("[dg dry-run] query %s", command)
+            return None
+        self._send_line(command)
+        buf = b""
+        deadline = time.monotonic() + self.timeout
+        self.sock.settimeout(0.05)
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    chunk = self.sock.recv(1024)
+                except socket.timeout:
+                    if buf:
+                        break
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+                if buf.endswith(b"\n"):
+                    break
+        finally:
+            self.sock.settimeout(self.timeout)
+        logger.debug("dg <- raw bytes: %r", buf)
+        return buf.decode("ascii", errors="replace").replace("\r\n", "\n").strip("\n")
+
+    # -- push ----------------------------------------------------------
+
+    def _push_all_once(self, chain: Dict[int, float]) -> None:
+        for ch in range(10):
+            self._send_line(f"TRIG T{ch},{self.TRIG_MODE}")
+            time.sleep(self.command_delay)
+        for ch in range(10):
+            self._send_line(f"WIDTH T{ch},{self.WIDTH_NS[ch]}")
+            time.sleep(self.command_delay)
+        for ch in range(1, 10):  # DELAY does not accept channel 0
+            self._send_line(f"DELAY T{ch},{int(round(chain[ch]))}")
+            time.sleep(self.command_delay)
+        if self.verify_after_push:
+            self._verify(chain)
+
+    def _verify(self, chain: Dict[int, float]) -> None:
+        for ch in range(1, 10):
+            expected = int(round(chain[ch]))
+            reply = self._query(f"DELAY? T{ch}")
+            if not reply:
+                logger.warning("delay generator: no reply verifying T%d", ch)
+                continue
+            try:
+                actual = int(reply.rsplit(",", 1)[-1])
+            except ValueError:
+                logger.warning("delay generator: could not parse verify reply for T%d: %r", ch, reply)
+                continue
+            if actual != expected:
+                logger.warning(
+                    "delay generator: verify mismatch T%d expected %d ps got %d ps", ch, expected, actual)
+
+    def _push_all(self) -> None:
+        # Trigger source is not retained across a power cycle (manual,
+        # NUT007), and a dropped connection can't be distinguished from a
+        # power cycle from the socket alone - so every push re-sends TRIG on
+        # all ten channels, not just DELAY.
+        chain = self._compute_chain()
+        self._validate_chain(chain)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.MAX_PUSH_ATTEMPTS + 1):
+            try:
+                self._ensure_connected()
+                self._push_all_once(chain)
+                return
+            except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as exc:
+                last_exc = exc
+                self._reconnect_count += 1
+                logger.warning(
+                    "delay generator: connection error on attempt %d/%d (%s); reconnecting "
+                    "(reconnect count=%d)",
+                    attempt, self.MAX_PUSH_ATTEMPTS, exc, self._reconnect_count,
+                )
+                self._close_socket()
+        raise PropertyError(
+            f"delay generator: push failed after {self.MAX_PUSH_ATTEMPTS} attempts: {last_exc}",
+            ERR_INTERNAL,
+        )
+
+    # -- unused in this task (external trigger only); provided for
+    # completeness since the instrument supports them -----------------
+
+    def set_amplitude(self, channel: int, millivolts: int) -> None:
+        self._send_line(f"AMPL T{channel},{int(millivolts)}")
+
+    def set_int_freq(self, fn: int, hz: int) -> None:
+        self._send_line(f"FREQ F{fn},{int(hz)}")
+
+    # -- SpecMan bindings ------------------------------------------------
+
+    def setter(self, param_name: str) -> Callable[[float], float]:
+        def _set(value_ns: float) -> float:
+            value_ps = value_ns * 1000.0  # all five bound properties are ns
+            trial = dict(self._params)
+            trial[param_name] = value_ps
+            chain = self._compute_chain(trial)
+            self._validate_chain(chain)
+            self._params = trial  # only commit once validation has passed
+            self._push_all()
+            return value_ns
+        return _set
+
+    def bind_all(self, property_table: PropertyTable) -> None:
+        # Bind by name, not index: the CFG file's property indices and
+        # DEFAULT_CONFIG's are known to disagree on occasion, and because
+        # every index in question exists in both tables a mismatch produces
+        # no error - it just lands writes on the wrong DG channel. Binding
+        # by name plus a startup dump makes that drift visible immediately.
+        by_name: Dict[str, int] = {}
+        for index, prop in property_table.all().items():
+            by_name[prop.name] = index
+
+        logger.info("delay generator: resolved property table (index, name, unit, direction, handshake):")
+        for index, prop in sorted(property_table.all().items()):
+            logger.info(
+                "  %2d  %-14s unit=%-4s direction=%-7s handshake=%s",
+                index, prop.name, prop.unit, prop.direction, prop.handshake,
+            )
+
+        logger.warning(
+            "delay generator: TRIG will be set to EXT on all ten channels, including T1/T2/T3 "
+            "(laser pretrigger/Q-switch) - the T-channel-to-laser BNC cabling map is UNCONFIRMED. "
+            "Verify cabling and laser state before the external trigger line goes live."
+        )
+
+        missing = [name for name in self.REQUIRED_NAMES if name not in by_name]
+        if missing:
+            raise ValueError(
+                f"delay generator: required properties {missing} not found in property table; "
+                f"available names: {sorted(by_name)}"
+            )
+
+        for name, param in self.NAME_TO_PARAM.items():
+            property_table.bind(by_name[name], setter=self.setter(param))
+
+
 # =====================================================================
 # Server: accept loop, connection lifecycle, handshake dispatch
 # =====================================================================
@@ -574,10 +865,10 @@ DEFAULT_CONFIG = {
     "properties": [
         {"index": 0, "name": "numPulses",   "unit": "",    "direction": "write", "handshake": True, "min": 1,   "max": 3},
         {"index": 1, "name": "delay1",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e9},
-        {"index": 2, "name": "delay2",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
-        {"index": 3, "name": "delay3",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
-        {"index": 4, "name": "pulseLen1",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
-        {"index": 5, "name": "pulseLen2",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
+        {"index": 3, "name": "delay2",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
+        {"index": 5, "name": "delay3",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
+        {"index": 2, "name": "pulseLen1",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
+        {"index": 4, "name": "pulseLen2",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
         {"index": 6, "name": "pulseLen3",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
         {"index": 7, "name": "phaseShift1", "unit": "deg", "direction": "write", "handshake": True, "min": 0.0, "max": 360.0},
         {"index": 8, "name": "phaseShift2", "unit": "deg", "direction": "write", "handshake": True, "min": 0.0, "max": 360.0},
@@ -585,17 +876,35 @@ DEFAULT_CONFIG = {
 }
 
 
-def bind_backend(property_table: PropertyTable, args: argparse.Namespace) -> None:
-    """Wire a hardware backend into the property table. Only a mock backend
-    exists today; point this at real hardware (cniAPI.py / vironAPI.py /
-    delay_generator.py) when that integration is ready."""
-    if args.mock_device:
+def bind_backend(property_table: PropertyTable, args: argparse.Namespace) -> Optional[DelayGeneratorBackend]:
+    """Wire a hardware backend into the property table. Returns the backend
+    instance if one needs a lifecycle hook (e.g. DelayGeneratorBackend.close
+    on disconnect), else None."""
+    if args.delay_generator and args.mock_device:
+        raise ValueError(
+            "--delay-generator and --mock-device are mutually exclusive; "
+            "pick one backend rather than letting one silently overwrite the other's bindings"
+        )
+
+    if args.delay_generator:
+        backend = DelayGeneratorBackend(
+            host=args.dg_host,
+            port=args.dg_port,
+            adv_ps=args.dg_adv_ms * 1e9,  # 1 ms = 1e9 ps
+            timeout=args.dg_timeout,
+            command_delay=args.dg_command_delay,
+            dry_run=args.dg_dry_run,
+        )
+        backend.bind_all(property_table)
+        return backend
+    elif args.mock_device:
         MockDevice().bind_all(property_table)
     elif not args.dry_run:
         logger.warning(
-            "no hardware backend bound (pass --mock-device or --dry-run); "
+            "no hardware backend bound (pass --mock-device, --delay-generator, or --dry-run); "
             "properties will just echo the in-memory store"
         )
+    return None
 
 
 def main() -> None:
@@ -608,6 +917,20 @@ def main() -> None:
                          help="log property writes instead of touching hardware")
     parser.add_argument("--mock-device", action="store_true",
                          help="bind an in-memory MockDevice instead of real hardware")
+    parser.add_argument("--delay-generator", action="store_true",
+                         help="bind a real GFT1004 delay generator backend")
+    parser.add_argument("--dg-host", default=None,
+                         help=f"delay generator host (default: {DelayGeneratorBackend.HOST_DEFAULT} or config)")
+    parser.add_argument("--dg-port", type=int, default=None,
+                         help=f"delay generator port (default: {DelayGeneratorBackend.PORT_DEFAULT} or config)")
+    parser.add_argument("--dg-adv-ms", type=float, default=None,
+                         help="ADV, in milliseconds (default: 16.625 or config)")
+    parser.add_argument("--dg-timeout", type=float, default=None,
+                         help="delay generator socket timeout, seconds (default: 2.0 or config)")
+    parser.add_argument("--dg-command-delay", type=float, default=None,
+                         help="inter-command delay, seconds (default: 0.02 or config)")
+    parser.add_argument("--dg-dry-run", action="store_true",
+                         help="log the exact ASCII delay generator commands instead of opening a socket")
     parser.add_argument("--self-test", action="store_true",
                          help="run a loopback self-test against this config and exit")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -626,7 +949,17 @@ def main() -> None:
         config = DEFAULT_CONFIG
 
     host = args.host or config.get("host", "0.0.0.0")
-    port = args.port or config.get("port", 5900)
+    port = args.port or config.get("port", 50001)
+
+    dg_config = config.get("delay_generator", {})
+    args.dg_host = args.dg_host or dg_config.get("host", DelayGeneratorBackend.HOST_DEFAULT)
+    args.dg_port = args.dg_port or dg_config.get("port", DelayGeneratorBackend.PORT_DEFAULT)
+    args.dg_adv_ms = args.dg_adv_ms if args.dg_adv_ms is not None else dg_config.get("adv_ms", 16.625)
+    args.dg_timeout = args.dg_timeout if args.dg_timeout is not None else dg_config.get("timeout", 2.0)
+    args.dg_command_delay = (
+        args.dg_command_delay if args.dg_command_delay is not None else dg_config.get("command_delay", 0.02)
+    )
+    args.dg_dry_run = args.dg_dry_run or dg_config.get("dry_run", False)
 
     property_table = PropertyTable.from_config(config)
 
@@ -635,9 +968,10 @@ def main() -> None:
         print("SELF-TEST PASSED" if ok else "SELF-TEST FAILED")
         sys.exit(0 if ok else 1)
 
-    bind_backend(property_table, args)
+    backend = bind_backend(property_table, args)
+    on_disconnect = backend.close if isinstance(backend, DelayGeneratorBackend) else None
 
-    server = SpecmanServer(host, port, property_table, dry_run=args.dry_run)
+    server = SpecmanServer(host, port, property_table, dry_run=args.dry_run, on_disconnect=on_disconnect)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
