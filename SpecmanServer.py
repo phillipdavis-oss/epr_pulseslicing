@@ -570,13 +570,17 @@ def run_self_test(host: str, port: int, property_table: PropertyTable) -> bool:
 
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
-    "port": 5900,
+    "port": 50001,
     "properties": [
-        {"index": 0, "name": "Field", "unit": "G", "direction": "write",
-         "handshake": True, "min": -5, "max": 5, "on_out_of_range": "reject"},
-        {"index": 1, "name": "Gradient", "unit": "G/cm", "direction": "write",
-         "handshake": True, "min": -5, "max": 5, "on_out_of_range": "reject"},
-        {"index": 2, "name": "Status", "unit": "", "direction": "read", "handshake": True},
+        {"index": 0, "name": "numPulses",   "unit": "",    "direction": "write", "handshake": True, "min": 1,   "max": 3},
+        {"index": 1, "name": "delay1",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e9},
+        {"index": 2, "name": "delay2",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
+        {"index": 3, "name": "delay3",      "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e4},
+        {"index": 4, "name": "pulseLen1",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
+        {"index": 5, "name": "pulseLen2",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
+        {"index": 6, "name": "pulseLen3",   "unit": "ns",  "direction": "write", "handshake": True, "min": 0.0, "max": 1e3},
+        {"index": 7, "name": "phaseShift1", "unit": "deg", "direction": "write", "handshake": True, "min": 0.0, "max": 360.0},
+        {"index": 8, "name": "phaseShift2", "unit": "deg", "direction": "write", "handshake": True, "min": 0.0, "max": 360.0},
     ],
 }
 
