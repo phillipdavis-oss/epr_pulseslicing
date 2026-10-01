@@ -335,14 +335,15 @@ class DelayGeneratorBackend:
     raw ASCII TCP (NUT007 Ed.13 4.2), matching the command set used by the
     working GUI in 682026_fullcontrol.py.
 
-    Every property write recomputes and re-pushes the entire ten-channel
-    state (TRIG, WIDTH, DELAY) in fixed channel order. SpecMan only sends a
-    property when that property's sweep axis advances, so most experiment
-    points touch exactly one of the five bound properties - pushing only the
-    changed channel would leave the rest of the chain holding stale values.
-    Re-pushing everything makes the instrument state a pure function of the
-    backend's held parameters rather than of which subset SpecMan happened
-    to send.
+    TRIG and WIDTH are fixed, so they are pushed once per connection (at
+    startup and on every reconnect), never on property writes. Every
+    property write recomputes and re-pushes all nine DELAY channels in fixed
+    order. SpecMan only sends a property when that property's sweep axis
+    advances, so most experiment points touch exactly one of the five bound
+    properties - pushing only the changed channel would leave the rest of
+    the chain holding stale values. Re-pushing every DELAY makes the
+    instrument state a pure function of the backend's held parameters
+    rather than of which subset SpecMan happened to send.
 
     Units: held state (self._params, chain dict) is picoseconds throughout.
     DELAY on the wire is picoseconds; WIDTH on the wire is nanoseconds - do
@@ -448,6 +449,24 @@ class DelayGeneratorBackend:
             raise
         self.sock = sock
         logger.info("delay generator: connected to %s:%d", self.host, self.port)
+        # Trigger source is not retained across a power cycle (manual,
+        # NUT007), and a dropped connection can't be distinguished from a
+        # power cycle from the socket alone - so every (re)connect re-sends
+        # TRIG and WIDTH on all ten channels.
+        self._push_config()
+
+    def start(self) -> None:
+        """Called once at server startup: connect and push TRIG/WIDTH so the
+        instrument is configured before SpecMan's first write. A failure here
+        is not fatal - the first write reconnects and pushes config anyway."""
+        if self.dry_run:
+            self._push_config()
+            return
+        try:
+            self._ensure_connected()
+        except OSError as exc:
+            self._close_socket()
+            logger.warning("delay generator: startup connect failed (%s); will retry on first write", exc)
 
     def _ensure_connected(self) -> None:
         if self.dry_run or self.sock is not None:
@@ -508,13 +527,16 @@ class DelayGeneratorBackend:
 
     # -- push ----------------------------------------------------------
 
-    def _push_all_once(self, chain: Dict[int, float]) -> None:
+    def _push_config(self) -> None:
+        logger.info("delay generator: pushing TRIG/WIDTH config")
         for ch in range(10):
             self._send_line(f"TRIG T{ch},{self.TRIG_MODE}")
             time.sleep(self.command_delay)
         for ch in range(10):
             self._send_line(f"WIDTH T{ch},{self.WIDTH_NS[ch]}")
             time.sleep(self.command_delay)
+
+    def _push_delays(self, chain: Dict[int, float]) -> None:
         for ch in range(1, 10):  # DELAY does not accept channel 0
             self._send_line(f"DELAY T{ch},{int(round(chain[ch]))}")
             time.sleep(self.command_delay)
@@ -538,17 +560,14 @@ class DelayGeneratorBackend:
                     "delay generator: verify mismatch T%d expected %d ps got %d ps", ch, expected, actual)
 
     def _push_all(self) -> None:
-        # Trigger source is not retained across a power cycle (manual,
-        # NUT007), and a dropped connection can't be distinguished from a
-        # power cycle from the socket alone - so every push re-sends TRIG on
-        # all ten channels, not just DELAY.
+        # DELAY only - TRIG/WIDTH are re-sent by _connect() on reconnect.
         chain = self._compute_chain()
         self._validate_chain(chain)
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.MAX_PUSH_ATTEMPTS + 1):
             try:
                 self._ensure_connected()
-                self._push_all_once(chain)
+                self._push_delays(chain)
                 return
             except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as exc:
                 last_exc = exc
@@ -969,7 +988,10 @@ def main() -> None:
         sys.exit(0 if ok else 1)
 
     backend = bind_backend(property_table, args)
-    on_disconnect = backend.close if isinstance(backend, DelayGeneratorBackend) else None
+    on_disconnect = None
+    if isinstance(backend, DelayGeneratorBackend):
+        backend.start()
+        on_disconnect = backend.close
 
     server = SpecmanServer(host, port, property_table, dry_run=args.dry_run, on_disconnect=on_disconnect)
     try:
